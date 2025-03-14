@@ -1,6 +1,9 @@
 import sys
 import math
+from sklearn.metrics import confusion_matrix
+import seaborn as sn
 import pandas as pd
+import numpy as np
 from collections import Counter
 from tqdm import tqdm
 import torch
@@ -11,6 +14,13 @@ from torch.utils.data import random_split, Dataset, DataLoader, WeightedRandomSa
 from torchvision.models import resnet50, ResNet50_Weights
 import torch.nn as nn
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+
+class ImageFolderWithPaths(ImageFolder):
+    def __getitem__(self, index):
+        original_tuple = super(ImageFolderWithPaths, self).__getitem__(index)
+        path = self.imgs[index][0]
+        tuple_with_path = (original_tuple + (path,))
+        return tuple_with_path
 
 def main():
     class EarlyStopping:
@@ -37,14 +47,11 @@ def main():
 
         def save_checkpoint(self, model):
             torch.save(model.state_dict(), self.path)
-
-
-
-
+        
 
     class SegmentClassifier():
     
-        def __init__(self, data_dir, num_classes, device, optim = 1, Transform = None, sample = True, loss_weights = True, batch_size = 8, num_workers = 0, lr = 1e-4, stop_early = True, freeze_backbone = True):
+        def __init__(self, id, data_dir, num_classes, device, optim = 1, Transform = None, sample = True, loss_weights = True, batch_size = 8, num_workers = 0, lr = 1e-4, stop_early = True, freeze_backbone = True):
         #############################################################################################################
         # data_dir: directory with images in subfolders, subfolders name are categories
         # num_classes: how many categories
@@ -57,6 +64,7 @@ def main():
         # stop_early = whether to stop fitting once metric stops improving
         # freeze_backbone: if using pretrained architecture freeze all but the classification layer
         ###############################################################################################################
+            self.id = id
             self.data_dir = data_dir # 'data'
             self.num_classes = num_classes # 4
             self.device = device
@@ -70,13 +78,18 @@ def main():
             self.stop_early = stop_early
             self.freeze_backbone = freeze_backbone
             self.Transform = Transform
+            self.val_predictions = []
+            self.val_targets = []
+            
             
         def load_data(self):
-            dataset = ImageFolder(root = self.data_dir, transform = self.Transform)
-
-            train_set, val_set = random_split(dataset, [math.floor(len(dataset)*0.8), math.ceil(len(dataset)*0.2)])
-
-            #train_set = train_set()
+            train_set = ImageFolder(root = self.data_dir + f"/training", transform = self.Transform)
+            val_set = ImageFolderWithPaths(root = self.data_dir + f"/validation", transform = transforms.Compose([
+                transforms.ToImage(),  # Convert to tensor, only needed if you had a PIL image
+                transforms.Resize(size = (224, 224), antialias=True),
+                transforms.ToDtype(torch.float32, scale=True)  # Normalize expects float input
+                ])
+            )
 
             self.train_classes = [label for _, label in train_set]
 
@@ -100,12 +113,12 @@ def main():
                 #         16
 
                 sampler = WeightedRandomSampler(weights = sample_weights,
-                                                num_samples = len(train_set), replacement = True)
+                                                num_samples = 1000, replacement = True)
                 train_loader = DataLoader(train_set, batch_size = self.batch_size, num_workers = self.num_workers, sampler = sampler)
-                val_loader = DataLoader(val_set, batch_size = self.batch_size, num_workers = self.num_workers, sampler = sampler)
+                val_loader = DataLoader(val_set, batch_size = self.batch_size, num_workers = self.num_workers)
             else:
                 train_loader = DataLoader(train_set, batch_size = self.batch_size, num_workers = self.num_workers, shuffle = True)
-                val_loader = DataLoader(val_set, batch_size = self.batch_size, num_workers = self.num_workers, shuffle = True)
+                val_loader = DataLoader(val_set, batch_size = self.batch_size, num_workers = self.num_workers)
             
             return train_loader, val_loader
 
@@ -123,7 +136,11 @@ def main():
                 #nn.ReLU(inplace=True),
                 #nn.Dropout(0.5))               # Dropout layer with 50% probability
 
+            with open('run_notes.csv', 'a') as rn:
+                rn.write('ID, Epoch, Training_loss, Validation_loss, Validation_accuracy' + '\n')
 
+            with open('val_notes.csv', 'a') as vn:
+                vn.write('ID, Epoch, Class, Prediction, Filename' + '\n')
 
 
             self.model = self.model.to(self.device)
@@ -147,6 +164,7 @@ def main():
         def fit_one_epoch(self, train_loader, epoch, num_epochs):
             train_losses = list()
             train_acc = list()
+            train_targets = [0, 0, 0, 0]
             self.model.train()
             for i, (images, targets) in enumerate(tqdm(train_loader)):
                 images = images.to(self.device)
@@ -164,21 +182,25 @@ def main():
                 num_correct = sum(predictions.eq(targets))
                 running_train_acc = float(num_correct) / float(images.shape[0])
                 train_acc.append(running_train_acc)
+                for target in targets: # keep track of how many of each class the model is being trained on
+                    train_targets[target.cpu().numpy()] += 1
 
             train_loss = torch.tensor(train_losses).mean()
             print(f'Epoch {epoch} /{num_epochs - 1}')
             print(f'Training loss: {train_loss:.2f}')
-
+            print(f'Class distribution: {train_targets}')
+            with open('run_notes.csv', 'a') as rn:
+                rn.write(f'{self.id},{epoch},{train_loss},')
         
 
 
 
-        def val_one_epoch(self, val_loader):
+        def val_one_epoch(self, val_loader, epoch):
             val_losses = list()
             val_accs = list()
             self.model.eval()
             with torch.no_grad():
-                for (images, targets) in val_loader:
+                for (images, targets, paths) in val_loader:
                     images = images.to(self.device)
                     targets = targets.to(self.device)
 
@@ -191,11 +213,19 @@ def main():
                     running_val_acc = float(num_correct) / float(images.shape[0])
 
                     val_accs.append(running_val_acc)
+                    #print(paths)
+                    with open('val_notes.csv', 'a') as vn:
+                        for i in range(len(paths)):
+                            vn.write(f'{self.id},{epoch},{targets[i]},{predictions[i]},{paths[i]}\n')
+                            self.val_targets.append(targets[i].cpu().numpy())
+                            self.val_predictions.append(predictions[i].cpu().numpy())
                 self.val_loss = torch.tensor(val_losses).mean()
                 val_acc = torch.tensor(val_accs).mean() # average acc per batch
 
                 print(f'Validation loss: {self.val_loss:.2f}')
                 print(f'Validation accuracy: {val_acc:.2f}')
+                with open('run_notes.csv', 'a') as rn:
+                    rn.write(f'{self.val_loss},{val_acc},\n')                
 
 
 
@@ -210,12 +240,19 @@ def main():
                             for param in self.model.parameters():
                                 param.requires_grad = True
                     self.fit_one_epoch(train_loader, epoch, num_epochs)
-                    self.val_one_epoch(val_loader)
+                    self.val_one_epoch(val_loader, epoch)
                     if self.stop_early:
                         early_stopping(self.val_loss, self.model)
                         if early_stopping.early_stop:
                             print('Early Stopping')
                             print(f'Best validation loss: {early_stopping.best_score}')
+
+        
+        def compute_confusion_matrix(preds, y):
+            #round predictions to the closest integer
+            rounded_preds = torch.round(torch.sigmoid(preds))
+            return confusion_matrix(y, rounded_preds)
+
 
 
     Transform = transforms.Compose([
@@ -232,46 +269,27 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     data_dir = "./data"
 
-    classifier_0 = SegmentClassifier(data_dir = data_dir, num_classes = 4, device = device, optim = 1, lr = 1e-2, batch_size = 32, num_workers = 4, Transform = Transform, sample = True, loss_weights = True)
-    train_loader, val_loader = classifier_0.load_data()
-    classifier_0.load_model()
-    classifier_0.fit(num_epochs = 20, unfreeze_after = 5, train_loader = train_loader, val_loader = val_loader)
-    try:
-        torch.save(classifier_0.model, "SegmentClassifier_0_M.pt")
-    except:
-        print("Could not save")
-        
-    classifier_1 = SegmentClassifier(data_dir = data_dir, num_classes = 4, device = device, optim = 2, lr = 1e-4, batch_size = 16, num_workers = 4, Transform = Transform, sample = True, loss_weights = True)
-    train_loader, val_loader = classifier_1.load_data()
-    classifier_1.load_model()
-    classifier_1.fit(num_epochs = 20, unfreeze_after = 5, train_loader = train_loader, val_loader = val_loader)
-    try:
-        torch.save(classifier_1.model, "SegmentClassifier_1_M.pt")
-    except:
-        print("Could not save")
+    classifier = SegmentClassifier(id = '21', data_dir = data_dir, num_classes = 4, device = device, optim = 1, lr = 1e-3, batch_size = 16, num_workers = 4, Transform = Transform, sample = True, loss_weights = True)
+    train_loader, val_loader = classifier.load_data()
+    classifier.load_model()
+    classifier.fit(num_epochs = 100, unfreeze_after = 5, train_loader = train_loader, val_loader = val_loader)
+    val_targets_labels = []
+    val_preds_labels = []
+    idx2class = {v: k for k, v in val_loader.dataset.class_to_idx.items()}
 
-    classifier_2 = SegmentClassifier(data_dir = data_dir, num_classes = 4, device = device, optim = 2, lr = 1e-5, batch_size = 16, num_workers = 8, Transform = Transform, sample = True, loss_weights = True)
-    train_loader, val_loader = classifier_2.load_data()
-    classifier_2.load_model()
-    classifier_2.fit(num_epochs = 20, unfreeze_after = 5, train_loader = train_loader, val_loader = val_loader)
-    try:
-        torch.save(classifier_2.model, "SegmentClassifier_2_M.pt")
-    except:
-        print("Could not save")
+    for (target, pred) in zip(classifier.val_targets, classifier.val_predictions):
+        val_targets_labels.append(idx2class[target.max()])
+        val_preds_labels.append(idx2class[pred.max()])
 
-    classifier_3 = SegmentClassifier(data_dir = data_dir, num_classes = 4, device = device, optim = 2, lr = 1e-2, batch_size = 32, num_workers = 8, Transform = Transform, sample = True, loss_weights = True)
-    train_loader, val_loader = classifier_3.load_data()
-    classifier_3.load_model()
-    classifier_3.fit(num_epochs = 20, unfreeze_after = 5, train_loader = train_loader, val_loader = val_loader)
-    try:
-        torch.save(classifier_3.model, "SegmentClassifier_3_M.pt")
-    except:
-        print("Could not save")
+    cm = confusion_matrix(val_targets_labels, val_preds_labels)
+    ConfusionMatrixDisplay(cm, display_labels = list(val_loader.dataset.class_to_idx.keys())).plot().show()
     
+    try:
+        torch.save(classifier.model, "SegmentClassifier.pt")
+    except:
+        print("Could not save") 
 
-        
-
-    
+#    classifier.compute_confusion_matrix()
 
 if __name__ == '__main__':
     main()
