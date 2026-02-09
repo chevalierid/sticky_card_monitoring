@@ -1,0 +1,161 @@
+import argparse
+import random
+import os
+import shutil
+from math import floor, ceil
+from collections import defaultdict
+from label_crops_2 import SegmentClassifier
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+import torch
+import torchvision.transforms.v2 as transforms  # composable transforms
+from torchvision.transforms import RandomRotation
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import numpy as np
+
+
+def cli_args():
+    args_parse = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
+    args_parse.add_argument("-m", "--mode", type=str, dest="mode", required=True,
+                            help="Whether to train model from scratch")
+    args_parse.add_argument("-s", "--split", dest="split", action='store_true',
+                            help="Whether to split dataset")
+    args = args_parse.parse_args()
+    return vars(args)
+
+def plot_training_history(history):
+    """Plots the training and validation loss and accuracy."""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+
+    # Plot losses
+    ax1.plot(history['train_losses'], label='Train Loss')
+    ax1.plot(history['val_losses'], label='Validation Loss')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss')
+    ax1.set_title('Training and Validation Loss')
+    ax1.legend()
+    ax1.grid(True)
+
+    # Plot accuracies
+    ax2.plot(history['train_acc'], label='Train Accuracy')
+    ax2.plot(history['val_acc'], label='Validation Accuracy')
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Accuracy')
+    ax2.set_title('Training and Validation Accuracy')
+    ax2.legend()
+    ax2.grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
+def classify(mode, split):
+    Transform = transforms.Compose([
+        transforms.ToImage(),  # Convert to tensor, only needed if you had a PIL image
+        # transforms.ToDtype(torch.uint8, scale=True),  # optional, most input are already uint8 at this point
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomRotation(20),
+        transforms.RandomVerticalFlip(p=0.5),
+        transforms.RandomApply([RandomRotation((90, 90))], p=0.5),
+        transforms.Resize(size=(224, 224), antialias=True),
+        transforms.ToDtype(torch.float32, scale=True),  # Normalize expects float input
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    seed = 4
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+
+    source_data_dir = "C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_positive_training\\data_unsplit"
+    destination_data_dir = "C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_positive_training\\data"
+    filenames = defaultdict(list)
+    num_files = 0
+    if split:
+        with os.scandir(source_data_dir) as ents:
+            for e in ents:
+                if e.is_dir():
+                    for f in os.scandir(e.path):
+                        filenames[e.name].append(f.name)
+                        num_files = num_files + 1
+        train_files = open(os.path.join(destination_data_dir, "train_filenames_temp.csv"), "w")
+        train_files.truncate(0)
+        test_files = open(os.path.join(destination_data_dir, "test_filenames_temp.csv"), "w")
+        test_files.truncate(0)
+        val_files = open(os.path.join(destination_data_dir, "val_filenames_temp.csv"), "w")
+        val_files.truncate(0)
+        pbar = tqdm(total=num_files, desc="Copying files", dynamic_ncols=True, unit="files", position=0, leave=True)
+        for label in filenames:
+            random.shuffle(filenames[label])
+            shutil.rmtree(os.path.join(destination_data_dir, "train", label))
+            os.makedirs(os.path.join(destination_data_dir, "train", label))
+            shutil.rmtree(os.path.join(destination_data_dir, "val", label))
+            os.makedirs(os.path.join(destination_data_dir, "val", label))
+            shutil.rmtree(os.path.join(destination_data_dir, "test", label))
+            os.makedirs(os.path.join(destination_data_dir, "test", label))
+            i = 0
+            for f in filenames[label]:
+                if i < floor(0.8 * len(filenames[label])):
+                    train_files.write(f + "," + label + "\n")
+                    shutil.copy(os.path.join(source_data_dir, label, f),
+                                os.path.join(destination_data_dir, "train", label))
+                elif i < floor(0.9 * len(filenames[label])):
+                    test_files.write(f + "," + label + "\n")
+                    shutil.copy(os.path.join(source_data_dir, label, f),
+                                os.path.join(destination_data_dir, "val", label))
+                elif i < floor(len(filenames[label])):
+                    test_files.write(f + "," + label + "\n")
+                    shutil.copy(os.path.join(source_data_dir, label, f),
+                                os.path.join(destination_data_dir, "test", label))
+                i = i + 1
+                pbar.update(1)
+        train_files.close()
+        val_files.close()
+        test_files.close()
+
+    print(f"Creating SegmentClassifier")
+
+    classifier = SegmentClassifier(id='3.4', data_dir=destination_data_dir, num_classes=5, device=device, optim=2,
+                                   lr=1e-2, batch_size=32, num_workers=4, Transform=Transform, sample=True,
+                                   loss_weights=True)
+
+    print(f"Loading data")
+    train_loader, val_loader = classifier.load_data()
+
+    print(f"Loading model")
+    if mode == "raw":
+        classifier.load_model()
+    else:
+        pretrained = torch.load("./SegmentClassifier_2025_03_27.pt", weights_only=False)
+        classifier.load_state_dict(pretrained)
+
+    print(f"Fitting SegmentClassifier")
+    history = classifier.fit(num_epochs=100, unfreeze_after=10, train_loader=train_loader, val_loader=val_loader)
+    val_targets_labels = []
+    val_preds_labels = []
+    idx2class = {v: k for k, v in val_loader.dataset.class_to_idx.items()}
+
+    for (target, pred) in zip(classifier.val_targets, classifier.val_predictions):
+        val_targets_labels.append(idx2class[target.max()])
+        val_preds_labels.append(idx2class[pred.max()])
+
+    plot_training_history(history)
+
+    cm = confusion_matrix(val_targets_labels, val_preds_labels)
+    ConfusionMatrixDisplay(cm, display_labels=list(val_loader.dataset.class_to_idx.keys())).plot()
+    plt.show()
+    try:
+        torch.save(classifier.model, "SegmentClassifier_5class.pt")
+    except:
+        print("Could not save")
+    print("stop")
+
+
+
+def main():
+    classify(**cli_args())
+
+
+if __name__ == '__main__':
+    main()
