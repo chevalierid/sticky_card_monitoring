@@ -4,7 +4,7 @@ import os
 import shutil
 from math import floor, ceil
 from collections import defaultdict
-from label_crops_2 import SegmentClassifier
+from label_crops import SegmentClassifier, calculate_mean_std_npb
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 import torch
 import torchvision.transforms.v2 as transforms  # composable transforms
@@ -22,6 +22,8 @@ def cli_args():
                             help="Whether to split dataset")
     args = args_parse.parse_args()
     return vars(args)
+
+
 
 def plot_training_history(history):
     """Plots the training and validation loss and accuracy."""
@@ -53,7 +55,6 @@ def classify(mode, split):
         transforms.ToImage(),  # Convert to tensor, only needed if you had a PIL image
         # transforms.ToDtype(torch.uint8, scale=True),  # optional, most input are already uint8 at this point
         transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomRotation(20),
         transforms.RandomVerticalFlip(p=0.5),
         transforms.RandomApply([RandomRotation((90, 90))], p=0.5),
         transforms.Resize(size=(224, 224), antialias=True),
@@ -68,8 +69,8 @@ def classify(mode, split):
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
 
-    source_data_dir = "C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_positive_training\\data_unsplit"
-    destination_data_dir = "C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_positive_training\\data"
+    source_data_dir = "C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_training_unsplit_rescaled"
+    destination_data_dir = "C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_training_rescaled"
     filenames = defaultdict(list)
     num_files = 0
     if split:
@@ -114,11 +115,13 @@ def classify(mode, split):
         val_files.close()
         test_files.close()
 
+    MEAN_NPB, STD_NPB = calculate_mean_std_npb(os.path.join(destination_data_dir, "train"))
+
     print(f"Creating SegmentClassifier")
 
-    classifier = SegmentClassifier(id='3.4', data_dir=destination_data_dir, num_classes=5, device=device, optim=2,
+    classifier = SegmentClassifier(id='3.6', data_dir=destination_data_dir, num_classes=5, device=device, optim=2,
                                    lr=1e-2, batch_size=32, num_workers=4, Transform=Transform, sample=True,
-                                   loss_weights=True)
+                                   loss_weights=True, mean_npb = MEAN_NPB, std_npb = STD_NPB)
 
     print(f"Loading data")
     train_loader, val_loader = classifier.load_data()
@@ -131,7 +134,7 @@ def classify(mode, split):
         classifier.load_state_dict(pretrained)
 
     print(f"Fitting SegmentClassifier")
-    history = classifier.fit(num_epochs=100, unfreeze_after=10, train_loader=train_loader, val_loader=val_loader)
+    history = classifier.fit(num_epochs=200, unfreeze_after=10, train_loader=train_loader, val_loader=val_loader)
     val_targets_labels = []
     val_preds_labels = []
     idx2class = {v: k for k, v in val_loader.dataset.class_to_idx.items()}

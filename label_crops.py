@@ -14,29 +14,131 @@ from tqdm import tqdm
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 import torch
 import torchvision.transforms.v2 as transforms  # composable transforms
-from torchvision.transforms import RandomRotation
 from torchvision.datasets import ImageFolder
+from torchvision.datasets.folder import default_loader, IMG_EXTENSIONS
 from torchvision.io import decode_image
 from torch.utils.data import random_split, Dataset, DataLoader, WeightedRandomSampler
 from torchvision.models import resnet50, ResNet50_Weights
+from torchvision.models.resnet import ResNet, Bottleneck
 import torch.nn as nn
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 
+def extract_info(filename):
+    w, h, npb, npa = filename.split("_")[-4:]
+    w = int(w)
+    h = int(h)
+    npb = int(npb)
+    npa = int(npa.split(".")[0])  # Remove file extension
+    return w, h, npb, npa
+
+# Function to calculate mean and standard deviation of width and height
+def calculate_mean_std_npb(directory):
+    npb_list = []
+    for root, dirs, files in os.walk(directory):
+        for filename in files:
+            if filename.endswith(tuple(IMG_EXTENSIONS)):  # Ensure it is an image file
+                _, _, npb, _ = extract_info(filename)
+                npb_list.append(npb)
+    mean_npb = np.mean(npb_list)
+    std_npb = np.std(npb_list)
+    return mean_npb, std_npb
+
+class SizeResNet50(ResNet):
+    def _forward_impl(self, input):
+        x = input["img"]
+        npb = input["npb"]
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        npb = npb.reshape((x.shape[0], 1))
+        x = torch.cat((x, npb), 1)
+        x = self.fc(x)
+
+        return x
+
+class OrigResNet50(ResNet):
+    def _forward_impl(self, input):
+        x = input["img"]
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
+
+        return x
+
+def my_resnet(
+        block,
+        layers,
+        weights,
+        progress,
+        original=True,
+        **kwargs,
+) -> SizeResNet50:
+    if original:
+        model = OrigResNet50(block, layers, **kwargs)
+    else:
+        model = SizeResNet50(block, layers, **kwargs)
+
+    if weights is not None:
+        model.load_state_dict(weights.get_state_dict(progress=progress))
+
+    return model
+
+def my_resnet50(*, original=True, weights=None, progress=True, **kwargs) -> SizeResNet50:
+    weights = ResNet50_Weights.verify(weights)
+    return my_resnet(Bottleneck, [3, 4, 6, 3], weights, progress, original=original, **kwargs)
 
 class ImageFolderWithPaths(ImageFolder):
-    def __getitem__(self, index):
-        original_tuple = super().__getitem__(index)
+    def __init__(self, mean_npb, std_npb,
+                root: str,
+                transform=None,
+                target_transform=None,
+                is_valid_file=None,
+                ):
+            super().__init__(
+                root,
+                transform=transform,
+                target_transform=target_transform,
+                is_valid_file=is_valid_file,
+            )
+            self.mean_npb = mean_npb
+            self.std_npb = std_npb
+
+    def __getitem__(self, index): # obj[index] = {"npb", "path"}[Image, label]
+        img, label = super().__getitem__(index)
         path = self.imgs[index][0]
-        tuple_with_path = (original_tuple + (path,))
-        return tuple_with_path
+        _, _, npb, _ = extract_info(os.path.basename(path))
+        npb = int(npb)
 
+        npb_norm = (npb - self.mean_npb) / self.std_npb
+        npb_norm = torch.tensor(npb_norm, dtype=torch.float32)
 
-class CustomDataset(ImageFolder):
-    def __getitem__(self, idx):
-        path, label = self.samples[idx]
         sample = self.loader(path)
-        return path, sample, label
+        if self.transform is not None:
+            sample = self.transform(sample)
+        if self.target_transform is not None:
+            label = self.target_transform(label)
+
+        return {"npb": npb_norm, "path": path, "img": sample}, label
 
 
 class EarlyStopping:
@@ -67,7 +169,7 @@ class EarlyStopping:
 
 class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assign module before Module.__init__() call" error
 
-    def __init__(self, id, data_dir, num_classes, device, optim=1, Transform=None, sample=True, loss_weights=True,
+    def __init__(self, id, data_dir, num_classes, device, mean_npb, std_npb, optim=1, Transform=None, sample=True, loss_weights=True,
                  batch_size=8, num_workers=0, lr=1e-4, stop_early=True, freeze_backbone=True):
         #############################################################################################################
         # data_dir: directory with images in subfolders, subfolders name are categories
@@ -86,6 +188,8 @@ class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assig
         self.data_dir = data_dir  # 'data'
         self.num_classes = num_classes  # 4
         self.device = device
+        self.mean_npb = mean_npb
+        self.std_npb = std_npb
         self.optim = optim
         self.sample = sample
         self.loss_weights = loss_weights
@@ -106,33 +210,17 @@ class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assig
         # separate function for applying transforms
         # CSV of image filenames, randomly split based on class dist
         '''
-        train_set = ImageFolder(os.path.join(self.data_dir, "train"), transform=self.Transform)
-        val_set = ImageFolderWithPaths(os.path.join(self.data_dir, "val"), transform=transforms.Compose([
-            transforms.ToImage(),  # Convert to tensor, only needed if you had a PIL image
-            transforms.Resize(size=(224, 224), antialias=True),
-            transforms.ToDtype(torch.float32, scale=True),  # Normalize expects float input,
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
+        train_set = ImageFolderWithPaths(root = os.path.join(self.data_dir, "train"), mean_npb = self.mean_npb, std_npb = self.std_npb,
+                                         transform=self.Transform)
+        val_set = ImageFolderWithPaths(root = os.path.join(self.data_dir, "val"), mean_npb = self.mean_npb, std_npb = self.std_npb,
+                                       transform=transforms.Compose([
+                                           transforms.ToImage(),  # Convert to tensor, only needed if you had a PIL image
+                                           transforms.Resize(size=(224, 224), antialias=True),
+                                           transforms.ToDtype(torch.float32, scale=True),  # Normalize expects float input,
+                                           transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                                       ])
                                        )
-
-        # train_files = ImageFolder(root = self.data_dir + f"/training", transform = self.Transform)
-        # val_files = ImageFolderWithPaths(root = self.data_dir + f"/validation", transform = transforms.Compose([
-        #     transforms.ToImage(),  # Convert to tensor, only needed if you had a PIL image
-        #     transforms.Resize(size = (224, 224), antialias=True),
-        #     transforms.ToDtype(torch.float32, scale=True)  # Normalize expects float input
-        #     ])
-        # )
-
-        # full_set = ImageFolder(root = self.data_dir + f"/all")
-        # train_set, val_set = torch.utils.data.random_split(full_set, [0.8, 0.2])
-        # # val_set = ImageFolderWithPaths(root = self.data_dir + f"/validation", transform = transforms.Compose([
-        # #     transforms.ToImage(),  # Convert to tensor, only needed if you had a PIL image
-        # #     transforms.Resize(size = (224, 224), antialias=True),
-        # #     transforms.ToDtype(torch.float32, scale=True)  # Normalize expects float input
-        # #     ])
-        # )
-
-        self.train_classes = [label for _, label in train_set]
+        self.train_classes = [i[1] for i in train_set]
 
         # because dataset is imbalanced:
         if self.sample:
@@ -144,7 +232,7 @@ class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assig
                 [len(self.train_classes) / c for c in pd.Series(class_count).sort_index().values])
 
             sample_weights = [0] * len(train_set)
-            for idx, (image, label) in enumerate(train_set):
+            for idx, (obj, label) in enumerate(train_set):
                 class_weight = class_weights[label]
                 sample_weights[idx] = class_weight
 
@@ -160,7 +248,7 @@ class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assig
         return train_loader, val_loader
 
     def load_model(self, arch='resnet', mode="new"):
-        self.model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
+        self.model = my_resnet50(weights=ResNet50_Weights.IMAGENET1K_V1, original = True)
         if self.freeze_backbone:
             for param in self.model.parameters():
                 param.requires_grad = False
@@ -168,9 +256,8 @@ class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assig
         #     param.requires_grad = True
         self.model.fc = nn.Sequential(nn.Linear(in_features=self.model.fc.in_features, out_features=256),
                                       nn.ReLU(inplace=True),
-                                      nn.Dropout(0.4),
+                                      #nn.Dropout(0.4),
                                       nn.Linear(in_features=256, out_features=self.num_classes))
-        # nn.Dropout(0.5))               # Dropout layer with 50% probability
 
         for param in self.model.fc.parameters():
             param.requires_grad = True
@@ -217,13 +304,16 @@ class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assig
         epoch_train_accs = list()
         train_targets = [0, 0, 0, 0, 0]
         self.model.train()
-        for i, (images, targets) in enumerate(tqdm(train_loader, position=0, leave=True)):
-            images = images.to(self.device)
-            targets = targets.to(self.device)
+#        for idx, (inputs, labels) in enumerate(tqdm(train_loader, position=0, leave=True)):
+        for idx, (inputs, labels) in enumerate(tqdm(train_loader, position=0, leave=True)):
+            inputs = {key: value.to(self.device) if hasattr(value, 'to') else value for key, value in inputs.items()}
+            labels = labels.to(self.device)
+            # images = obj["img"].to(self.device)
+            # targets = label.to(self.device)
 
             self.optimizer.zero_grad()
-            logits = self.model(images)
-            loss = self.criterion(logits, targets)
+            logits = self.model(inputs)
+            loss = self.criterion(logits, labels)
 
             loss.backward()
             self.optimizer.step()
@@ -231,11 +321,11 @@ class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assig
             epoch_train_losses.append(loss.item())
 
             predictions = torch.argmax(logits, dim=1)
-            num_correct = sum(predictions.eq(targets))
-            running_train_acc = float(num_correct) / float(images.shape[0])
+            num_correct = sum(predictions.eq(labels))
+            running_train_acc = float(num_correct) / float(inputs["img"].shape[0])
             epoch_train_accs.append(running_train_acc)
-            for target in targets:  # keep track of how many of each class the model is being trained on
-                train_targets[target.cpu().numpy()] += 1
+            for label in labels:  # keep track of how many of each class the model is being trained on
+                train_targets[label.cpu().numpy()] += 1
 
         train_loss = torch.tensor(epoch_train_losses).mean()
         train_acc = torch.tensor(epoch_train_accs).mean()
@@ -259,29 +349,31 @@ class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assig
         val_targets = [0, 0, 0, 0, 0]
         self.model.eval()
         with torch.no_grad():
-            for (images, targets, paths) in val_loader:
-                images = images.to(self.device)
-                targets = targets.to(self.device)
+            for (inputs, labels) in val_loader:
+                inputs = {key: value.to(self.device) if hasattr(value, 'to') else value for key, value in inputs.items()}
+                labels = labels.to(self.device)
+                # images = obj["img"].to(self.device)
+                # targets = label.to(self.device)
 
-                logits = self.model(images)
-                loss = self.criterion(logits, targets)
+                logits = self.model(inputs)
+                loss = self.criterion(logits, labels)
                 epoch_val_losses.append(loss.item())
 
                 predictions = torch.argmax(logits, dim=1)
-                num_correct = sum(predictions.eq(targets))
-                running_val_acc = float(num_correct) / float(images.shape[0])
+                num_correct = sum(predictions.eq(labels))
+                running_val_acc = float(num_correct) / float(inputs["img"].shape[0])
 
                 epoch_val_accs.append(running_val_acc)
-                for target in targets:  # keep track of how many of each class the model is being trained on
+                for target in labels:  # keep track of how many of each class the model is being trained on
                     val_targets[target.cpu().numpy()] += 1
                 correct_per_class = [0] * self.num_classes
                 with open("C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_positive_training\\val_notes.csv", 'a') as vn:
-                    for i in range(len(paths)):
-                        vn.write(f'{self.id},{epoch},{targets[i]},{predictions[i]},{paths[i]}\n')
-                        self.val_targets.append(targets[i].cpu().numpy())
+                    for i in range(len(inputs["path"])):
+                        vn.write(f'{self.id},{epoch},{labels[i]},{predictions[i]},{inputs["path"][i]}\n')
+                        self.val_targets.append(labels[i].cpu().numpy())
                         self.val_predictions.append(predictions[i].cpu().numpy())
                         # print how many are correct in each category
-                        correct_per_class[targets[i].item()] += (targets[i] == predictions[i]).item()
+                        correct_per_class[labels[i].item()] += (labels[i] == predictions[i]).item()
 
             self.val_loss = torch.tensor(epoch_val_losses).mean()
             val_acc = torch.tensor(epoch_val_accs).mean()  # average acc per batch
