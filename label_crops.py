@@ -126,11 +126,13 @@ class ImageFolderWithPaths(ImageFolder):
     def __getitem__(self, index): # obj[index] = {"npb", "path"}[Image, label]
         img, label = super().__getitem__(index)
         path = self.imgs[index][0]
-        _, _, npb, _ = extract_info(os.path.basename(path))
-        npb = int(npb)
+        npb_norm = None
+        if self.mean_npb is not None:
+            _, _, npb, _ = extract_info(os.path.basename(path))
+            npb = int(npb)
 
-        npb_norm = (npb - self.mean_npb) / self.std_npb
-        npb_norm = torch.tensor(npb_norm, dtype=torch.float32)
+            npb_norm = (npb - self.mean_npb) / self.std_npb
+            npb_norm = torch.tensor(npb_norm, dtype=torch.float32)
 
         sample = self.loader(path)
         if self.transform is not None:
@@ -169,7 +171,7 @@ class EarlyStopping:
 
 class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assign module before Module.__init__() call" error
 
-    def __init__(self, id, data_dir, num_classes, device, mean_npb, std_npb, optim=1, Transform=None, sample=True, loss_weights=True,
+    def __init__(self, id, data_dir, num_classes, device, mean_npb = None, std_npb = None, optim=1, Transform=None, sample=True, loss_weights=True,
                  batch_size=8, num_workers=0, lr=1e-4, stop_early=True, freeze_backbone=True):
         #############################################################################################################
         # data_dir: directory with images in subfolders, subfolders name are categories
@@ -248,13 +250,13 @@ class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assig
         return train_loader, val_loader
 
     def load_model(self, arch='resnet', mode="new"):
-        self.model = my_resnet50(weights=ResNet50_Weights.IMAGENET1K_V1, original = True)
+        self.model = my_resnet50(weights=ResNet50_Weights.IMAGENET1K_V1, original = (self.mean_npb is None))
         if self.freeze_backbone:
             for param in self.model.parameters():
                 param.requires_grad = False
         #    for param in self.model.fc.parameters():
         #     param.requires_grad = True
-        self.model.fc = nn.Sequential(nn.Linear(in_features=self.model.fc.in_features, out_features=256),
+        self.model.fc = nn.Sequential(nn.Linear(in_features=self.model.fc.in_features+(self.mean_npb is None), out_features=256),
                                       nn.ReLU(inplace=True),
                                       #nn.Dropout(0.4),
                                       nn.Linear(in_features=256, out_features=self.num_classes))
@@ -270,10 +272,10 @@ class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assig
         # for param in self.model.layer4.parameters():
         #     param.requires_grad = True
 
-        with open("C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_positive_training\\run_notes.csv", 'a') as rn:
+        with open("C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_training\\run_notes.csv", 'a') as rn:
             rn.write('ID, Epoch, Training_loss, validation_loss, validation_accuracy' + '\n')
 
-        with open("C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_positive_training\\val_notes.csv", 'a') as vn:
+        with open("C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_training\\val_notes.csv", 'a') as vn:
             vn.write('ID, Epoch, Class, Prediction, Filename' + '\n')
 
         self.model = self.model.to(self.device)
@@ -296,13 +298,13 @@ class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assig
 
         if mode == "existing":
             self.model = torch.load(
-                "C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_positive_training\\SegmentClassifier_2025_03_27.pt",
+                "C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_training\\SegmentClassifier_2025_03_27.pt",
                 weights_only=False)
 
     def fit_one_epoch(self, train_loader, epoch, num_epochs, start_timestamp):
         epoch_train_losses = list()
         epoch_train_accs = list()
-        train_targets = [0, 0, 0, 0, 0]
+        train_targets = [0] * self.num_classes
         self.model.train()
 #        for idx, (inputs, labels) in enumerate(tqdm(train_loader, position=0, leave=True)):
         for idx, (inputs, labels) in enumerate(tqdm(train_loader, position=0, leave=True)):
@@ -336,7 +338,7 @@ class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assig
         print(f'Training loss: {train_loss:.2f}')
         print(f'Class distribution: {train_targets}')
         print(f'Learning rate: {self.lr}')
-        with open("C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_positive_training\\run_notes.csv", 'a') as rn:
+        with open("C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_training\\run_notes.csv", 'a') as rn:
             rn.write(f'{self.id},{epoch},{train_loss},')
         return {
             'train_loss': train_loss,
@@ -346,7 +348,7 @@ class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assig
     def val_one_epoch(self, val_loader, epoch):
         epoch_val_losses = list()
         epoch_val_accs = list()
-        val_targets = [0, 0, 0, 0, 0]
+        val_targets = [0] * self.num_classes
         self.model.eval()
         with torch.no_grad():
             for (inputs, labels) in val_loader:
@@ -367,7 +369,7 @@ class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assig
                 for target in labels:  # keep track of how many of each class the model is being trained on
                     val_targets[target.cpu().numpy()] += 1
                 correct_per_class = [0] * self.num_classes
-                with open("C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_positive_training\\val_notes.csv", 'a') as vn:
+                with open("C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_training\\val_notes.csv", 'a') as vn:
                     for i in range(len(inputs["path"])):
                         vn.write(f'{self.id},{epoch},{labels[i]},{predictions[i]},{inputs["path"][i]}\n')
                         self.val_targets.append(labels[i].cpu().numpy())
@@ -382,7 +384,7 @@ class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assig
             print(f'validation accuracy: {val_acc:.2f}')
             print(f'Class distribution: {val_targets}')
             print(f'Correct: {correct_per_class}')
-            with open("C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_positive_training\\run_notes.csv", 'a') as rn:
+            with open("C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_training\\run_notes.csv", 'a') as rn:
                 rn.write(f'{self.val_loss},{val_acc},\n')
             return {
                 'val_loss': self.val_loss,

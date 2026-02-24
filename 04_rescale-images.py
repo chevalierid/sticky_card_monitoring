@@ -2,6 +2,7 @@ import os
 import cv2
 import numpy as np
 from glob import glob
+from tqdm import tqdm
 
 # d'après Melika Baghooee https://github.com/darsa-group/size-aware-classification/blob/main/04_rescale-images.py
 
@@ -50,7 +51,7 @@ for species_folder in os.listdir(SRC_DIR):
         os.makedirs(target_folder_path, exist_ok=True)
 
         # Process each image in the species folder
-        for item_path in images:
+        for item_path in tqdm(images, position=0, leave=True):
             item = os.path.basename(item_path)
             img = cv2.imread(item_path)
 
