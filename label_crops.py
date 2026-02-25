@@ -126,7 +126,7 @@ class ImageFolderWithPaths(ImageFolder):
     def __getitem__(self, index): # obj[index] = {"npb", "path"}[Image, label]
         img, label = super().__getitem__(index)
         path = self.imgs[index][0]
-        npb_norm = None
+        npb_norm = 0
         if self.mean_npb is not None:
             _, _, npb, _ = extract_info(os.path.basename(path))
             npb = int(npb)
@@ -256,7 +256,7 @@ class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assig
                 param.requires_grad = False
         #    for param in self.model.fc.parameters():
         #     param.requires_grad = True
-        self.model.fc = nn.Sequential(nn.Linear(in_features=self.model.fc.in_features+(self.mean_npb is None), out_features=256),
+        self.model.fc = nn.Sequential(nn.Linear(in_features=self.model.fc.in_features + (self.mean_npb is not None), out_features=256),
                                       nn.ReLU(inplace=True),
                                       #nn.Dropout(0.4),
                                       nn.Linear(in_features=256, out_features=self.num_classes))

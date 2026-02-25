@@ -124,8 +124,8 @@ def classify(mode, split, size_aware):
         MEAN_NPB, STD_NPB = None, None
 
     print(f"Creating SegmentClassifier")
-
-    classifier = SegmentClassifier(id="4.0", data_dir=destination_data_dir, num_classes=4, device=device, optim=2,
+    run_id = "4.0"
+    classifier = SegmentClassifier(id=run_id, data_dir=destination_data_dir, num_classes=4, device=device, optim=2,
                                    lr=1e-2, batch_size=32, num_workers=4, Transform=Transform, sample=True,
                                    loss_weights=True, mean_npb = MEAN_NPB, std_npb = STD_NPB)
 
@@ -154,9 +154,9 @@ def classify(mode, split, size_aware):
     cm = confusion_matrix(val_targets_labels, val_preds_labels)
     ConfusionMatrixDisplay(cm, display_labels=list(val_loader.dataset.class_to_idx.keys())).plot()
     plt.show()
-    current_datetime = datetime.datetime.now()
+    #current_datetime = datetime.datetime.now()
     try:
-        torch.save(classifier.model, f"SegmentClassifier_5class.pt")
+        torch.save(classifier.model, f"SegmentClassifier_4class_{run_id}.pt")
     except:
         print("Could not save")
     print("stop")
