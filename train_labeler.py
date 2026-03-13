@@ -2,7 +2,7 @@ import argparse
 import random
 import os
 import shutil
-import datetime
+from datetime import datetime
 from math import floor, ceil
 from collections import defaultdict
 from label_crops import SegmentClassifier, calculate_mean_std_npb
@@ -13,6 +13,9 @@ from torchvision.transforms import RandomRotation
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import numpy as np
+import pandas as pd
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
 
 
 def cli_args():
@@ -33,8 +36,11 @@ def plot_training_history(history):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
 
     # Plot losses
-    ax1.plot(history['train_losses'], label='Train Loss')
-    ax1.plot(history['val_losses'], label='Validation Loss')
+    #ax1.plot(history['train_losses'], label='Train Loss')
+    #ax1.plot(history['val_losses'], label='Validation Loss')
+    for i in range(len(history['train_losses'])):
+        ax1.plot([pt[i] for pt in history['train_losses']],label = 'id %s'%i)
+        ax1.plot([pt[i] for pt in history['val_losses']], label='id %s' % i)
     ax1.set_xlabel('Epoch')
     ax1.set_ylabel('Loss')
     ax1.set_title('Training and Validation Loss')
@@ -72,8 +78,8 @@ def classify(mode, split, size_aware):
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
 
-    source_data_dir = "C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_positive_training\\data_4class_unsplit"
-    destination_data_dir = "C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_positive_training\\data_4class"
+    source_data_dir = "C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_positive_training\\data_unsplit"
+    destination_data_dir = "C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_positive_training\\data"
     filenames = defaultdict(list)
     num_files = 0
     if split:
@@ -124,42 +130,122 @@ def classify(mode, split, size_aware):
         MEAN_NPB, STD_NPB = None, None
 
     print(f"Creating SegmentClassifier")
-    run_id = "4.0"
-    classifier = SegmentClassifier(id=run_id, data_dir=destination_data_dir, num_classes=4, device=device, optim=2,
-                                   lr=1e-2, batch_size=32, num_workers=4, Transform=Transform, sample=True,
-                                   loss_weights=True, mean_npb = MEAN_NPB, std_npb = STD_NPB)
+    run_id = "4.25_" + datetime.today().strftime("%m-%d-%H-%M")
 
-    print(f"Loading data")
-    train_loader, val_loader = classifier.load_data()
 
     print(f"Loading model")
     if mode == "raw":
+        classifier = SegmentClassifier(id=run_id, data_dir=destination_data_dir, num_classes=5, device=device, optim=2,
+                                       lr=1e-2, batch_size=32, num_workers=4, Transform=Transform, sample=True,
+                                       loss_weights=True, mean_npb=MEAN_NPB, std_npb=STD_NPB)
+        print(f"Loading data")
+        train_loader, val_loader = classifier.load_data()
         classifier.load_model()
+        print(f"Fitting SegmentClassifier")
+        history = classifier.fit(num_epochs=100, unfreeze_after=10, train_loader=train_loader, val_loader=val_loader)
+        val_targets_labels = []
+        val_preds_labels = []
+        idx2class = {v: k for k, v in val_loader.dataset.class_to_idx.items()}
+        for (target, pred) in zip(classifier.val_targets, classifier.val_predictions):
+            val_targets_labels.append(idx2class[target.max()])
+            val_preds_labels.append(idx2class[pred.max()])
+
+        plot_training_history(history)
+
+        cm = confusion_matrix(val_targets_labels, val_preds_labels)
+        ConfusionMatrixDisplay(cm, display_labels=list(val_loader.dataset.class_to_idx.keys())).plot()
+        plt.show()
+        # current_datetime = datetime.datetime.now()
+        try:
+            torch.save(classifier.model, f"SegmentClassifier_4class_{run_id}.pt")
+        except:
+            print("Could not save")
+        print("stop")
+    elif mode == "bioclip":
+        classifier = SegmentClassifier(id=run_id, data_dir=destination_data_dir, num_classes=5, device=device, optim=2,
+                                       lr=1e-2, batch_size=32, num_workers=4, Transform=Transform, sample=True,
+                                       loss_weights=True, mean_npb=MEAN_NPB, std_npb=STD_NPB)
+        print(f"Loading data")
+        train_loader, val_loader = classifier.load_data()
+        weights = torch.load("C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_training\\open_clip_pytorch_model.bin", weights_only=False)
+        classifier.load_model(pass_weights = weights)
+        print(f"Fitting SegmentClassifier")
+        history = classifier.fit(num_epochs=20, unfreeze_after=10, train_loader=train_loader, val_loader=val_loader)
+        val_targets_labels = []
+        val_preds_labels = []
+        idx2class = {v: k for k, v in val_loader.dataset.class_to_idx.items()}
+        for (target, pred) in zip(classifier.val_targets, classifier.val_predictions):
+            val_targets_labels.append(idx2class[target.max()])
+            val_preds_labels.append(idx2class[pred.max()])
+
+        plot_training_history(history)
+
+        cm = confusion_matrix(val_targets_labels, val_preds_labels)
+        ConfusionMatrixDisplay(cm, display_labels=list(val_loader.dataset.class_to_idx.keys())).plot()
+        plt.show()
+        # current_datetime = datetime.datetime.now()
+        try:
+            torch.save(classifier.model, f"SegmentClassifier_4class_{run_id}.pt")
+        except:
+            print("Could not save")
+        print("stop")
     else:
-        pretrained = torch.load("./SegmentClassifier_2025_03_27.pt", weights_only=False)
-        classifier.load_state_dict(pretrained)
+        test_data_dir = "C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_positive_training\\data_test_set\\test"
+        pretrained = torch.load("C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_positive_training\\SegmentClassifier_2025_03_27.pt", weights_only=False)
+        pretrained.eval()
 
-    print(f"Fitting SegmentClassifier")
-    history = classifier.fit(num_epochs=100, unfreeze_after=10, train_loader=train_loader, val_loader=val_loader)
-    val_targets_labels = []
-    val_preds_labels = []
-    idx2class = {v: k for k, v in val_loader.dataset.class_to_idx.items()}
+        class Classifier_Test(Dataset):
+            def __init__(self, dir, transform=None):
+                self.dir = dir
+                self.transform = transform
+                self.images = os.listdir(self.dir)
 
-    for (target, pred) in zip(classifier.val_targets, classifier.val_predictions):
-        val_targets_labels.append(idx2class[target.max()])
-        val_preds_labels.append(idx2class[pred.max()])
+            def __len__(self):
+                return len(self.images)
 
-    plot_training_history(history)
+            def __getitem__(self, index):
+                # print(os.path.join(self.dir, self.images[idx]))
+                img = Image.open(os.path.join(self.dir, self.images[index]))
+                return self.transform(img), self.images[index]
 
-    cm = confusion_matrix(val_targets_labels, val_preds_labels)
-    ConfusionMatrixDisplay(cm, display_labels=list(val_loader.dataset.class_to_idx.keys())).plot()
-    plt.show()
-    #current_datetime = datetime.datetime.now()
-    try:
-        torch.save(classifier.model, f"SegmentClassifier_4class_{run_id}.pt")
-    except:
-        print("Could not save")
-    print("stop")
+        # check whether val_set results match last epoch or best epoch
+        val_set = Classifier_Test(test_data_dir, transform=transforms.Compose([
+            transforms.ToImage(),  # Convert to tensor, only needed if you had a PIL image
+            transforms.Resize(size=(224, 224), antialias=True),
+            transforms.ToDtype(torch.float32, scale=True),  # Normalize expects float input
+            transforms.Lambda(lambda x: x[:3])
+            # remove alpha channel since the model's dataset is built with ImageFolder which is RGB
+        ]))
+
+        val_loader = DataLoader(val_set, batch_size=32)
+
+        sub = pd.DataFrame(columns=['category', 'id'])
+        id_list = []
+        pred_list = []
+
+        pretrained = pretrained.to(device)
+
+        with torch.no_grad():
+            for (image, image_id) in val_loader:
+                image = image.to(device)
+
+                logits = pretrained(image)
+                predicted = list(torch.argmax(logits, 1).cpu().numpy())
+
+                for id in image_id:
+                    id_list.append(id)
+
+                for prediction in predicted:
+                    pred_list.append(prediction.tolist())
+
+        sub['category'] = pred_list
+        sub['id'] = id_list
+
+        mapping = {0: 'Non-target', 1: 'SWD_male', 2: 'SWD_parasitoid', 3: 'Weevil'}
+
+        sub['category'] = sub['category'].map(mapping)
+        sub = sub.sort_values(by='id')
+        sub.to_csv(test_data_dir + "train.csv", index=False)
 
 
 

@@ -1,12 +1,5 @@
-import sys
-import math
-from sklearn.metrics import confusion_matrix
-import seaborn as sn
 from datetime import datetime
 import numpy as np
-import random
-from math import floor, ceil
-from collections import defaultdict
 import os
 import pandas as pd
 from collections import Counter
@@ -16,12 +9,10 @@ import torch
 import torchvision.transforms.v2 as transforms  # composable transforms
 from torchvision.datasets import ImageFolder
 from torchvision.datasets.folder import default_loader, IMG_EXTENSIONS
-from torchvision.io import decode_image
 from torch.utils.data import random_split, Dataset, DataLoader, WeightedRandomSampler
-from torchvision.models import resnet50, ResNet50_Weights
+from torchvision.models import resnet50, ResNet50_Weights, get_model_weights
 from torchvision.models.resnet import ResNet, Bottleneck
 import torch.nn as nn
-import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 
 def extract_info(filename):
@@ -185,10 +176,10 @@ class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assig
         # stop_early = whether to stop fitting once metric stops improving
         # freeze_backbone: if using pretrained architecture freeze all but the classification layer
         ###############################################################################################################
-        self.val_loss = None
         self.id = id
         self.data_dir = data_dir  # 'data'
         self.num_classes = num_classes  # 4
+        self.val_loss = [0] * self.num_classes
         self.device = device
         self.mean_npb = mean_npb
         self.std_npb = std_npb
@@ -230,16 +221,16 @@ class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assig
             # class_count[train_set.class_to_idx["Other"]] = round(class_count[train_set.class_to_idx["Other"]]/3)
             # divide the total # of images by # of each class
             # class_weights = 1./torch.tensor(class_count, dtype=torch.float)
-            class_weights = torch.Tensor(
+            self.class_weights = torch.Tensor(
                 [len(self.train_classes) / c for c in pd.Series(class_count).sort_index().values])
 
-            sample_weights = [0] * len(train_set)
+            self.sample_weights = [0] * len(train_set)
             for idx, (obj, label) in enumerate(train_set):
-                class_weight = class_weights[label]
-                sample_weights[idx] = class_weight
+                class_weight = self.class_weights[label]
+                self.sample_weights[idx] = class_weight
 
-            sampler = WeightedRandomSampler(weights=sample_weights,
-                                            num_samples=len(sample_weights), replacement=True)
+            sampler = WeightedRandomSampler(weights=self.sample_weights,
+                                            num_samples=len(self.sample_weights), replacement=True)
             train_loader = DataLoader(train_set, batch_size=self.batch_size, num_workers=self.num_workers,
                                       sampler=sampler)
             val_loader = DataLoader(val_set, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=True)
@@ -247,10 +238,14 @@ class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assig
             train_loader = DataLoader(train_set, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=True)
             val_loader = DataLoader(val_set, batch_size=2, num_workers=self.num_workers)
 
+        self.class_mappings = train_loader.dataset.class_to_idx.items()
         return train_loader, val_loader
 
     def load_model(self, arch='resnet', mode="new"):
-        self.model = my_resnet50(weights=ResNet50_Weights.IMAGENET1K_V1, original = (self.mean_npb is None))
+        if mode == "new":
+            self.model = my_resnet50(weights=ResNet50_Weights.IMAGENET1K_V1, original = (self.mean_npb is None))
+        elif mode == "bioclip":
+            self.model = torch.load("C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_training\\open_clip_pytorch_model.bin", weights_only=False)
         if self.freeze_backbone:
             for param in self.model.parameters():
                 param.requires_grad = False
@@ -272,10 +267,17 @@ class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assig
         # for param in self.model.layer4.parameters():
         #     param.requires_grad = True
 
-        with open("C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_training\\run_notes.csv", 'a') as rn:
-            rn.write('ID, Epoch, Training_loss, validation_loss, validation_accuracy' + '\n')
+        with open(f"C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_training\\run_notes_{self.id}.csv", 'a') as rn:
+            #rn.write('ID, Epoch, Training_loss, validation_loss, validation_accuracy' + '\n')
+            rn.write('ID, Epoch,')
+            cols = ['Training_loss_', 'Training_acc_', 'Validation_loss_', 'Validation_acc_']
+            for col in cols:
+                for class_id in self.class_mappings:
+                    rn.write(col + str(class_id[0]) + ',')
+                rn.write(col + 'mean' + ',')
+            rn.write('\n')
 
-        with open("C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_training\\val_notes.csv", 'a') as vn:
+        with open(f"C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_training\\val_notes_{self.id}.csv", 'a') as vn:
             vn.write('ID, Epoch, Class, Prediction, Filename' + '\n')
 
         self.model = self.model.to(self.device)
@@ -285,107 +287,201 @@ class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assig
         elif self.optim == 2:
             self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr)
 
-        # scheduler = lr_scheduler.StepLR(self.optimizer, step_size=10, gamma=0.1)
+        #self.scheduler = lr_scheduler.StepLR(self.optimizer, step_size=10, gamma=0.1)
 
         if self.loss_weights:
             class_count = Counter(self.train_classes)
             class_weights = torch.Tensor(
                 [len(self.train_classes) / c for c in pd.Series(class_count).sort_index().values])
             class_weights = class_weights.to(self.device)
-            self.criterion = nn.CrossEntropyLoss(weight=class_weights)
-        else:
             self.criterion = nn.CrossEntropyLoss()
+            self.crit_weight = nn.CrossEntropyLoss(weight=class_weights)
+            self.crit_weight_none = nn.CrossEntropyLoss(weight=class_weights, reduction = 'none')
+            self.crit_noweight_none = nn.CrossEntropyLoss(reduction = 'none')
+            # self.crit_blank = nn.CrossEntropyLoss(weight=class_weights)
+            # self.crit_mean = nn.CrossEntropyLoss(weight=class_weights, reduction='mean')
+            # self.crit_none = nn.CrossEntropyLoss(weight=class_weights, reduction='none')
+        else:
+            self.criterion = nn.CrossEntropyLoss(reduction = 'none')
 
-        if mode == "existing":
-            self.model = torch.load(
-                "C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_training\\SegmentClassifier_2025_03_27.pt",
-                weights_only=False)
+        # if mode == "existing":
+        #     self.model = torch.load(
+        #         "C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_training\\SegmentClassifier_2025_03_27.pt",
+        #         weights_only=False)
 
     def fit_one_epoch(self, train_loader, epoch, num_epochs, start_timestamp):
         epoch_train_losses = list()
         epoch_train_accs = list()
+        # o_train_loss = [0] * self.num_classes
+        # o_train_acc = [0] * self.num_classes
+        # train_loss = [0] * self.num_classes
+        # train_acc = [0] * self.num_classes
+        epoch_train_losses_perclass = [list() for x in range(self.num_classes)]
+        epoch_train_accs_perclass = [list() for x in range(self.num_classes)]
+        running_epoch_train_losses_perclass = [list() for x in range(self.num_classes)]
+        running_epoch_train_accs_perclass = [list() for x in range(self.num_classes)]
         train_targets = [0] * self.num_classes
+        num_samples_trained = 0
+        self.class_weights = self.class_weights.to(self.device)
         self.model.train()
-#        for idx, (inputs, labels) in enumerate(tqdm(train_loader, position=0, leave=True)):
         for idx, (inputs, labels) in enumerate(tqdm(train_loader, position=0, leave=True)):
             inputs = {key: value.to(self.device) if hasattr(value, 'to') else value for key, value in inputs.items()}
             labels = labels.to(self.device)
-            # images = obj["img"].to(self.device)
-            # targets = label.to(self.device)
 
             self.optimizer.zero_grad()
             logits = self.model(inputs)
             loss = self.criterion(logits, labels)
+            #loss_mean = self.crit_mean(logits, labels)
+            #loss_none = self.crit_none(logits, labels)
+
+            # loss_none_avg = [0] * len(loss_none)
+            # for i in range(len(loss_none)):
+            #     loss_none_avg[i] = loss_none[i] / self.class_weights[int(labels[i])]
+
+            # loss_none_mult = [0] * len(loss_none)
+            # for i in range(len(loss_none)):
+            #     loss_none_mult[i] = loss_none[i] * self.class_weights[int(labels[i])]
+            # loss_sum = 0
+            # for i in range(len(loss_none_mult)):
+            #     loss_sum = (loss_none_mult[i] / self.class_weights[int(labels[i])].sum()).sum()
+            # loss_sum
+
+            #loss_noweight = self.crit_noweight(logits, labels)
+            loss_noweight_none = self.crit_noweight_none(logits, labels)
+            loss_noweight_none = loss_noweight_none.to(self.device)
+            loss_weight = self.crit_weight(logits, labels)
+            loss_weight_none = self.crit_weight_none(logits, labels)
+            #label_ints = [tensor.item() for tensor in labels]
+            #loss_noweight_none = loss_noweight_none * self.class_weights[label_ints]
+            #loss_noweight_none = (loss_noweight_none / self.class_weights[label_ints].sum()).sum()
 
             loss.backward()
             self.optimizer.step()
-
+            #self.scheduler.step()
             epoch_train_losses.append(loss.item())
-
             predictions = torch.argmax(logits, dim=1)
             num_correct = sum(predictions.eq(labels))
             running_train_acc = float(num_correct) / float(inputs["img"].shape[0])
             epoch_train_accs.append(running_train_acc)
-            for label in labels:  # keep track of how many of each class the model is being trained on
-                train_targets[label.cpu().numpy()] += 1
+
+            for i in range(len(labels)):
+                running_epoch_train_losses_perclass[int(labels[i])].append(loss_noweight_none[i])
+                running_epoch_train_accs_perclass[int(labels[i])].append(predictions.eq(labels)[i])
+                train_targets[int(labels[i])] += 1
+
+            num_samples_trained += len(labels)
+
+        for i in range(self.num_classes):
+            if len(running_epoch_train_losses_perclass[i]) > 0:
+                epoch_train_losses_perclass[i] = (float(sum(running_epoch_train_losses_perclass[i])/len(running_epoch_train_losses_perclass[i])))
+            if len(running_epoch_train_accs_perclass[i]) > 0:
+                epoch_train_accs_perclass[i] = (float(sum(running_epoch_train_accs_perclass[i])/len(running_epoch_train_accs_perclass[i])))
+
+            # for label in labels:  # keep track of how many of each class the model is being trained on
+            #     train_targets[label.cpu().numpy()] += 1
 
         train_loss = torch.tensor(epoch_train_losses).mean()
         train_acc = torch.tensor(epoch_train_accs).mean()
+        #for i in range(self.num_classes):
+        #    train_loss[i] = sum(epoch_train_losses_perclass[i])/len(epoch_train_losses_perclass[i])
+        #    train_acc[i] = sum(epoch_train_accs_perclass[i])/len(epoch_train_accs_perclass[i])
 
         time_diff = datetime.today() - start_timestamp
 
         print(f'Epoch {epoch} /{num_epochs - 1}, {time_diff}')
-        print(f'Training loss: {train_loss:.2f}')
+        print(f'Per-class training loss: {np.around(epoch_train_losses_perclass, 2)}')
+        print(f'Mean training loss: {train_loss:.2f}')
+        print(f'Training accuracy: {train_acc:.2f}')
         print(f'Class distribution: {train_targets}')
         print(f'Learning rate: {self.lr}')
-        with open("C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_training\\run_notes.csv", 'a') as rn:
-            rn.write(f'{self.id},{epoch},{train_loss},')
+
+        # with open("C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_training\\run_notes_pc.csv", 'a', newline = '') as rn:
+        #     wr = csv.writer(rn)
+        #     wr.writerow([self.id] + [epoch] + train_loss)
+        with open(f"C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_training\\run_notes_{self.id}.csv", 'a', newline='') as rn:
+            rn.write(f'{self.id},{epoch},')
+            for i in range(len(epoch_train_losses_perclass)):
+                rn.write(f'{epoch_train_losses_perclass[i]},')
+            rn.write(f'{train_loss},')
+            for i in range(len(epoch_train_accs_perclass)):
+                rn.write(f'{epoch_train_accs_perclass[i]},')
+            rn.write(f'{train_acc},')
         return {
-            'train_loss': train_loss,
+            'train_loss': epoch_train_losses,
             'train_acc': train_acc
         }
 
     def val_one_epoch(self, val_loader, epoch):
         epoch_val_losses = list()
         epoch_val_accs = list()
+        #val_loss = list()
+        #val_acc = list()
+        #val_loss = [0] * self.num_classes
+        val_acc = [0] * self.num_classes
+        epoch_val_losses_perclass = [list() for x in range(self.num_classes)]
+        epoch_val_accs_perclass = [list() for x in range(self.num_classes)]
+        running_epoch_val_losses_perclass = [list() for x in range(self.num_classes)]
+        running_epoch_val_accs_perclass = [list() for x in range(self.num_classes)]
         val_targets = [0] * self.num_classes
         self.model.eval()
         with torch.no_grad():
             for (inputs, labels) in val_loader:
                 inputs = {key: value.to(self.device) if hasattr(value, 'to') else value for key, value in inputs.items()}
                 labels = labels.to(self.device)
-                # images = obj["img"].to(self.device)
-                # targets = label.to(self.device)
 
                 logits = self.model(inputs)
                 loss = self.criterion(logits, labels)
-                epoch_val_losses.append(loss.item())
+                loss_noweight_none = self.crit_noweight_none(logits, labels)
+                loss_noweight_none = loss_noweight_none.to(self.device)
 
+                epoch_val_losses.append(loss.item())
                 predictions = torch.argmax(logits, dim=1)
                 num_correct = sum(predictions.eq(labels))
                 running_val_acc = float(num_correct) / float(inputs["img"].shape[0])
-
                 epoch_val_accs.append(running_val_acc)
-                for target in labels:  # keep track of how many of each class the model is being trained on
-                    val_targets[target.cpu().numpy()] += 1
                 correct_per_class = [0] * self.num_classes
-                with open("C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_training\\val_notes.csv", 'a') as vn:
+
+                for i in range(len(labels)):
+                    running_epoch_val_losses_perclass[int(labels[i])].append(loss_noweight_none[i])
+                    running_epoch_val_accs_perclass[int(labels[i])].append(predictions.eq(labels)[i])
+                    correct_per_class[labels[i].item()] += (labels[i] == predictions[i]).item()
+                    val_targets[int(labels[i])] += 1
+
+                with open(f"C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_training\\val_notes_{self.id}.csv", 'a') as vn:
                     for i in range(len(inputs["path"])):
                         vn.write(f'{self.id},{epoch},{labels[i]},{predictions[i]},{inputs["path"][i]}\n')
                         self.val_targets.append(labels[i].cpu().numpy())
                         self.val_predictions.append(predictions[i].cpu().numpy())
                         # print how many are correct in each category
-                        correct_per_class[labels[i].item()] += (labels[i] == predictions[i]).item()
+
+
+            for i in range(self.num_classes):
+                if len(running_epoch_val_losses_perclass[i]) > 0:
+                    epoch_val_losses_perclass[i] = float(sum(running_epoch_val_losses_perclass[i]) / len(running_epoch_val_losses_perclass[i]))
+                if len(running_epoch_val_accs_perclass[i]) > 0:
+                        epoch_val_accs_perclass[i] = float(sum(running_epoch_val_accs_perclass[i]) / len(running_epoch_val_accs_perclass[i]))
 
             self.val_loss = torch.tensor(epoch_val_losses).mean()
             val_acc = torch.tensor(epoch_val_accs).mean()  # average acc per batch
+            # for i in range(self.num_classes):
+            #     self.val_loss[i] = torch.tensor(epoch_val_losses_perclass[i]).mean()
+            #     if len(epoch_val_accs_perclass) > 0:
+            #         val_acc[i] = sum(epoch_val_accs_perclass[i]) / len(epoch_val_accs_perclass[i])
 
-            print(f'validation loss: {self.val_loss:.2f}')
-            print(f'validation accuracy: {val_acc:.2f}')
+            print(f'Per-class validation loss: {np.around(epoch_val_losses_perclass, 2)}')
+            print(f'Mean validation loss: {self.val_loss:.2f}')
+            print(f'Validation accuracy: {val_acc:.2f}')
             print(f'Class distribution: {val_targets}')
             print(f'Correct: {correct_per_class}')
-            with open("C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_training\\run_notes.csv", 'a') as rn:
-                rn.write(f'{self.val_loss},{val_acc},\n')
+            with open(f"C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_training\\run_notes_{self.id}.csv", 'a') as rn:
+                #rn.write(f'{self.val_loss},{val_acc},\n')
+                for i in range(len(epoch_val_losses_perclass)):
+                    rn.write(f'{epoch_val_losses_perclass[i]},')
+                rn.write(f'{self.val_loss},')
+                for i in range(len(epoch_val_accs_perclass)):
+                    rn.write(f'{epoch_val_accs_perclass[i]},')
+                rn.write(f'{val_acc},')
+                rn.write("\n")
             return {
                 'val_loss': self.val_loss,
                 'val_acc': val_acc
