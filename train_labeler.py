@@ -24,6 +24,8 @@ def cli_args():
                             help="Whether to train model from scratch")
     args_parse.add_argument("-s", "--split", dest="split", action='store_true',
                             help="Whether to split dataset")
+    args_parse.add_argument("-r", "--arch", type=str, dest="arch",
+                            help="Model architecture (resnet, bioclip)")
     args_parse.add_argument("-a", "--size_aware", dest="size_aware", action='store_true',
                             help="Whether to perform size-aware classification")
     args = args_parse.parse_args()
@@ -59,7 +61,52 @@ def plot_training_history(history):
     plt.tight_layout()
     plt.show()
 
-def classify(mode, split, size_aware):
+def split_data(source_data_dir, destination_data_dir):
+    filenames = defaultdict(list)
+    num_files = 0
+    with os.scandir(source_data_dir) as ents:
+        for e in ents:
+            if e.is_dir():
+                for f in os.scandir(e.path):
+                    filenames[e.name].append(f.name)
+                    num_files = num_files + 1
+    train_files = open(os.path.join(destination_data_dir, "train_filenames_temp.csv"), "w")
+    train_files.truncate(0)
+    test_files = open(os.path.join(destination_data_dir, "test_filenames_temp.csv"), "w")
+    test_files.truncate(0)
+    val_files = open(os.path.join(destination_data_dir, "val_filenames_temp.csv"), "w")
+    val_files.truncate(0)
+    pbar = tqdm(total=num_files, desc="Copying files", dynamic_ncols=True, unit="files", position=0, leave=True)
+    for label in filenames:
+        random.shuffle(filenames[label])
+        shutil.rmtree(os.path.join(destination_data_dir, "train", label))
+        os.makedirs(os.path.join(destination_data_dir, "train", label))
+        shutil.rmtree(os.path.join(destination_data_dir, "val", label))
+        os.makedirs(os.path.join(destination_data_dir, "val", label))
+        shutil.rmtree(os.path.join(destination_data_dir, "test", label))
+        os.makedirs(os.path.join(destination_data_dir, "test", label))
+        i = 0
+        for f in filenames[label]:
+            if i < floor(0.8 * len(filenames[label])):
+                train_files.write(f + "," + label + "\n")
+                shutil.copy(os.path.join(source_data_dir, label, f),
+                            os.path.join(destination_data_dir, "train", label))
+            elif i < floor(0.9 * len(filenames[label])):
+                test_files.write(f + "," + label + "\n")
+                shutil.copy(os.path.join(source_data_dir, label, f),
+                            os.path.join(destination_data_dir, "val", label))
+            elif i < floor(len(filenames[label])):
+                test_files.write(f + "," + label + "\n")
+                shutil.copy(os.path.join(source_data_dir, label, f),
+                            os.path.join(destination_data_dir, "test", label))
+            i = i + 1
+            pbar.update(1)
+    train_files.close()
+    val_files.close()
+    test_files.close()
+    return filenames, num_files
+
+def classify(mode, split, arch, size_aware):
     Transform = transforms.Compose([
         transforms.ToImage(),  # Convert to tensor, only needed if you had a PIL image
         # transforms.ToDtype(torch.uint8, scale=True),  # optional, most input are already uint8 at this point
@@ -78,51 +125,12 @@ def classify(mode, split, size_aware):
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
 
-    source_data_dir = "C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_positive_training\\data_unsplit"
-    destination_data_dir = "C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_positive_training\\data"
-    filenames = defaultdict(list)
-    num_files = 0
+    source_data_dir = "C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_training_unsplit"
+    destination_data_dir = "C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_training"
+    # source_data_dir = "C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_positive_training\\dataset_small_unsplit"
+    # destination_data_dir = "C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_positive_training\\dataset_small"
     if split:
-        with os.scandir(source_data_dir) as ents:
-            for e in ents:
-                if e.is_dir():
-                    for f in os.scandir(e.path):
-                        filenames[e.name].append(f.name)
-                        num_files = num_files + 1
-        train_files = open(os.path.join(destination_data_dir, "train_filenames_temp.csv"), "w")
-        train_files.truncate(0)
-        test_files = open(os.path.join(destination_data_dir, "test_filenames_temp.csv"), "w")
-        test_files.truncate(0)
-        val_files = open(os.path.join(destination_data_dir, "val_filenames_temp.csv"), "w")
-        val_files.truncate(0)
-        pbar = tqdm(total=num_files, desc="Copying files", dynamic_ncols=True, unit="files", position=0, leave=True)
-        for label in filenames:
-            random.shuffle(filenames[label])
-            shutil.rmtree(os.path.join(destination_data_dir, "train", label))
-            os.makedirs(os.path.join(destination_data_dir, "train", label))
-            shutil.rmtree(os.path.join(destination_data_dir, "val", label))
-            os.makedirs(os.path.join(destination_data_dir, "val", label))
-            shutil.rmtree(os.path.join(destination_data_dir, "test", label))
-            os.makedirs(os.path.join(destination_data_dir, "test", label))
-            i = 0
-            for f in filenames[label]:
-                if i < floor(0.8 * len(filenames[label])):
-                    train_files.write(f + "," + label + "\n")
-                    shutil.copy(os.path.join(source_data_dir, label, f),
-                                os.path.join(destination_data_dir, "train", label))
-                elif i < floor(0.9 * len(filenames[label])):
-                    test_files.write(f + "," + label + "\n")
-                    shutil.copy(os.path.join(source_data_dir, label, f),
-                                os.path.join(destination_data_dir, "val", label))
-                elif i < floor(len(filenames[label])):
-                    test_files.write(f + "," + label + "\n")
-                    shutil.copy(os.path.join(source_data_dir, label, f),
-                                os.path.join(destination_data_dir, "test", label))
-                i = i + 1
-                pbar.update(1)
-        train_files.close()
-        val_files.close()
-        test_files.close()
+        filenames, num_files = split_data(source_data_dir, destination_data_dir)
 
     if size_aware:
         MEAN_NPB, STD_NPB = calculate_mean_std_npb(os.path.join(destination_data_dir, "train"))
@@ -130,15 +138,17 @@ def classify(mode, split, size_aware):
         MEAN_NPB, STD_NPB = None, None
 
     print(f"Creating SegmentClassifier")
-    run_id = "4.25_" + datetime.today().strftime("%m-%d-%H-%M")
+    run_id = "4.28_" + datetime.today().strftime("%m-%d-%H-%M")
 
 
     print(f"Loading model")
     if mode == "raw":
-        classifier = SegmentClassifier(id=run_id, data_dir=destination_data_dir, num_classes=5, device=device, optim=2,
+        classifier = SegmentClassifier(arch=arch, id=run_id, data_dir=destination_data_dir, num_classes=5,
+                                       device=device, optim=2,
                                        lr=1e-2, batch_size=32, num_workers=4, Transform=Transform, sample=True,
                                        loss_weights=True, mean_npb=MEAN_NPB, std_npb=STD_NPB)
         print(f"Loading data")
+
         train_loader, val_loader = classifier.load_data()
         classifier.load_model()
         print(f"Fitting SegmentClassifier")
@@ -150,44 +160,17 @@ def classify(mode, split, size_aware):
             val_targets_labels.append(idx2class[target.max()])
             val_preds_labels.append(idx2class[pred.max()])
 
-        plot_training_history(history)
+        try:
+            torch.save(classifier.model, f"SegmentClassifier_{run_id}.pt")
+        except:
+            print("Could not save")
+
+        #plot_training_history(history)
 
         cm = confusion_matrix(val_targets_labels, val_preds_labels)
         ConfusionMatrixDisplay(cm, display_labels=list(val_loader.dataset.class_to_idx.keys())).plot()
         plt.show()
         # current_datetime = datetime.datetime.now()
-        try:
-            torch.save(classifier.model, f"SegmentClassifier_4class_{run_id}.pt")
-        except:
-            print("Could not save")
-        print("stop")
-    elif mode == "bioclip":
-        classifier = SegmentClassifier(id=run_id, data_dir=destination_data_dir, num_classes=5, device=device, optim=2,
-                                       lr=1e-2, batch_size=32, num_workers=4, Transform=Transform, sample=True,
-                                       loss_weights=True, mean_npb=MEAN_NPB, std_npb=STD_NPB)
-        print(f"Loading data")
-        train_loader, val_loader = classifier.load_data()
-        weights = torch.load("C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_training\\open_clip_pytorch_model.bin", weights_only=False)
-        classifier.load_model(pass_weights = weights)
-        print(f"Fitting SegmentClassifier")
-        history = classifier.fit(num_epochs=20, unfreeze_after=10, train_loader=train_loader, val_loader=val_loader)
-        val_targets_labels = []
-        val_preds_labels = []
-        idx2class = {v: k for k, v in val_loader.dataset.class_to_idx.items()}
-        for (target, pred) in zip(classifier.val_targets, classifier.val_predictions):
-            val_targets_labels.append(idx2class[target.max()])
-            val_preds_labels.append(idx2class[pred.max()])
-
-        plot_training_history(history)
-
-        cm = confusion_matrix(val_targets_labels, val_preds_labels)
-        ConfusionMatrixDisplay(cm, display_labels=list(val_loader.dataset.class_to_idx.keys())).plot()
-        plt.show()
-        # current_datetime = datetime.datetime.now()
-        try:
-            torch.save(classifier.model, f"SegmentClassifier_4class_{run_id}.pt")
-        except:
-            print("Could not save")
         print("stop")
     else:
         test_data_dir = "C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_positive_training\\data_test_set\\test"
