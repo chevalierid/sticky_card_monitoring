@@ -31,7 +31,7 @@ These data originated from a cross-Canada survey conducted in 2022. Please conta
 
 `train_labeller.py` has a number of arguments, described in `def cli_args()` at top of file.
 
-Among these arguments is a size-aware classification option that has not been tested with the most recent updates. This requires input data that have been processed with `rescale-images.py`.
+Among these arguments is a size-aware classification option that has not been tested with the most recent updates. This requires input data that have been processed with `04_rescale-images.py`.
 
 ## Annotating scanned sticky cards with pretrained model
 
