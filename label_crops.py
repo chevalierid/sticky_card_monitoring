@@ -1,4 +1,5 @@
 from datetime import datetime
+from PIL import Image
 import numpy as np
 import os
 import pandas as pd
@@ -12,6 +13,7 @@ from torchvision.datasets.folder import default_loader, IMG_EXTENSIONS
 from torch.utils.data import random_split, Dataset, DataLoader, WeightedRandomSampler
 from torchvision.models import resnet50, ResNet50_Weights, get_model_weights
 from torchvision.models.resnet import ResNet, Bottleneck
+import torchvision.transforms.functional as F
 import torch.nn as nn
 #import open_clip
 import torch.optim.lr_scheduler as lr_scheduler
@@ -36,6 +38,7 @@ def calculate_mean_std_npb(directory):
     std_npb = np.std(npb_list)
     return mean_npb, std_npb
 
+# TODO modify OrigResNet50 and SizeResNet50 classes to save class mappings (+ number of classes) as attributes
 class SizeResNet50(ResNet):
     def _forward_impl(self, input):
         x = input["img"]
@@ -160,10 +163,25 @@ class EarlyStopping:
     def save_checkpoint(self, model):
         torch.save(model.state_dict(), self.path)
 
+class ClassifierTest(Dataset):
+    def __init__(self, dir, transform=None):
+        self.dir = dir
+        self.transform = transform
+        self.images = [f for f in os.listdir(self.dir) if (os.path.isfile(os.path.join(self.dir,f)) & f.lower().endswith(('.png', '.jpg', '.jpeg')))]
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, index):
+        #print(os.path.join(self.dir, self.images[idx]))
+        img = Image.open(os.path.join(self.dir, self.images[index])).convert('RGB')
+        img = F.pil_to_tensor(img)
+        img = F.convert_image_dtype(img)
+        return {"img": self.transform(img)}, self.images[index]
 
 class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assign module before Module.__init__() call" error
 
-    def __init__(self, id, data_dir, num_classes, device, arch = "resnet", mean_npb = None, std_npb = None, optim=1, Transform=None, sample=True, loss_weights=True,
+    def __init__(self, id, data_dir, num_classes, device, mean_npb = None, std_npb = None, optim=1, Transform=None, sample=True, loss_weights=True,
                  batch_size=8, num_workers=0, lr=1e-4, stop_early=True, freeze_backbone=True):
         #############################################################################################################
         # data_dir: directory with images in subfolders, subfolders name are categories
@@ -182,7 +200,6 @@ class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assig
         self.num_classes = num_classes  # 4
         self.val_loss = [0] * self.num_classes
         self.device = device
-        self.arch = arch
         self.mean_npb = mean_npb
         self.std_npb = std_npb
         self.optim = optim
@@ -238,24 +255,35 @@ class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assig
             val_loader = DataLoader(val_set, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=True)
         else:
             train_loader = DataLoader(train_set, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=True)
-            val_loader = DataLoader(val_set, batch_size=2, num_workers=self.num_workers)
+            val_loader = DataLoader(val_set, batch_size=self.batch_size, num_workers=self.num_workers)
 
         self.class_mappings = train_loader.dataset.class_to_idx.items()
         return train_loader, val_loader
 
-    def load_model(self):
-        #if self.arch == "resnet":
-        self.model = my_resnet50(weights=ResNet50_Weights.IMAGENET1K_V1, original = (self.mean_npb is None))
-        # elif self.arch == "bioclip":
-        #     self.model, preprocess_train, preprocess_val = open_clip.create_model_and_transforms(
-        #         'hf-hub:imageomics/bioclip-2.5-vith14')
-        #     tokenizer = open_clip.get_tokenizer('hf-hub:imageomics/bioclip-2.5-vith14')
+    def load_inference_data(self):
+        test_set = ClassifierTest(dir=self.data_dir,transform=transforms.Compose([
+                                           transforms.ToImage(),
+                                           transforms.Resize(size=(224, 224), antialias=True),
+                                           transforms.ToDtype(torch.float32, scale=True),
+                                           transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                                       ])
+                                       )
+        test_loader = DataLoader(test_set, batch_size=self.batch_size, num_workers=self.num_workers)
+        return test_loader
+
+    def load_model(self, pretrained = None):
+        if pretrained is not None:
+            self.model = pretrained
+        else:
+            self.model = my_resnet50(weights=ResNet50_Weights.IMAGENET1K_V1, original = (self.mean_npb is None))
+            self.model.fc = nn.Sequential(nn.Linear(in_features=self.model.fc.in_features + (self.mean_npb is not None),
+                                                    out_features=256),
+                                          nn.ReLU(inplace=True),
+                                          nn.Linear(in_features=256, out_features=self.num_classes))
+
         if self.freeze_backbone:
             for param in self.model.parameters():
                 param.requires_grad = False
-        self.model.fc = nn.Sequential(nn.Linear(in_features=self.model.fc.in_features + (self.mean_npb is not None), out_features=256),
-                                      nn.ReLU(inplace=True),
-                                      nn.Linear(in_features=256, out_features=self.num_classes))
 
         for param in self.model.fc.parameters():
             param.requires_grad = True
@@ -299,35 +327,17 @@ class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assig
         else:
             self.criterion = nn.CrossEntropyLoss(reduction = 'none')
 
-        # if mode == "existing":
-        #     self.model = torch.load(
-        #         "C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_training\\SegmentClassifier_2025_03_27.pt",
-        #         weights_only=False)
+    def load_inference_model(self):
+        self.model = my_resnet50(original=(self.mean_npb is None))
+        self.model.fc = nn.Sequential(nn.Linear(in_features=self.model.fc.in_features + (self.mean_npb is not None),
+                                                out_features=256),
+                                      nn.ReLU(inplace=True),
+                                      nn.Linear(in_features=256, out_features=self.num_classes))
+        self.model = self.model.to(self.device)
 
-    # def load_bioclip(self):
-    #     self.model, preprocess_train, preprocess_val = open_clip.create_model_and_transforms(
-    #         'hf-hub:imageomics/bioclip-2.5-vith14')
-    #     train_set = ImageFolderWithPaths(root=os.path.join(self.data_dir, "train"), mean_npb=self.mean_npb,
-    #                                      std_npb=self.std_npb,
-    #                                      transform=preprocess_train)
-    #     val_set = ImageFolderWithPaths(root=os.path.join(self.data_dir, "val"), mean_npb=self.mean_npb,
-    #                                    std_npb=self.std_npb,
-    #                                    transform=preprocess_val)
-    #     self.train_classes = [i[1] for i in train_set]
-    #     tokenizer = open_clip.get_tokenizer('hf-hub:imageomics/bioclip-2.5-vith14')
-    #     start_epoch = 0
-    #     data = {}
-    #     data["train"] = get_dataset_fn(args.train_data, args.dataset_type)(
-    #         args, preprocess_train, is_train=True, epoch=epoch, tokenizer=tokenizer)
-    #     data = get_data(args, (preprocess_train, preprocess_val), epoch=start_epoch,
-    #                     tokenizer=tokenizer)
     def fit_one_epoch(self, train_loader, epoch, num_epochs, start_timestamp):
         epoch_train_losses = list()
         epoch_train_accs = list()
-        # o_train_loss = [0] * self.num_classes
-        # o_train_acc = [0] * self.num_classes
-        # train_loss = [0] * self.num_classes
-        # train_acc = [0] * self.num_classes
         epoch_train_losses_perclass = [list() for x in range(self.num_classes)]
         epoch_train_accs_perclass = [list() for x in range(self.num_classes)]
         running_epoch_train_losses_perclass = [list() for x in range(self.num_classes)]
@@ -336,6 +346,8 @@ class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assig
         num_samples_trained = 0
         running_maxes = [[list() for x in range(self.num_classes)] for x in range(self.num_classes)]
         train_maxes = [[list() for x in range(self.num_classes)] for x in range(self.num_classes)]
+        true_positive_maxes = [list() for x in range(self.num_classes)]
+        false_positive_maxes = [list() for x in range(self.num_classes)]
         self.class_weights = self.class_weights.to(self.device)
         self.model.train()
         for idx, (inputs, labels) in enumerate(tqdm(train_loader, position=0, leave=True)):
@@ -344,6 +356,7 @@ class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assig
 
             self.optimizer.zero_grad()
             logits = self.model(inputs)
+            loss = self.criterion(logits, labels)
             loss = self.criterion(logits, labels)
             loss_noweight_none = self.crit_noweight_none(logits, labels)
             loss_noweight_none = loss_noweight_none.to(self.device)
@@ -362,7 +375,10 @@ class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assig
                 running_epoch_train_losses_perclass[int(labels[i])].append(loss_noweight_none[i])
                 running_epoch_train_accs_perclass[int(labels[i])].append(predictions.eq(labels)[i])
                 train_targets[int(labels[i])] += 1
-
+                if int(labels[i]) == int(predictions[i]):
+                    true_positive_maxes[int(labels[i])].append(float(max(probs[i])))
+                else:
+                    false_positive_maxes[int(labels[i])].append(float(max(probs[i])))
             num_samples_trained += len(labels)
         self.scheduler.step()
         for i in range(self.num_classes):
@@ -384,6 +400,7 @@ class SegmentClassifier():  # took out nn.Module inheritance bc of "cannot assig
         print(f'Training accuracy: {train_acc:.2f}')
         print(f'Class distribution: {train_targets}')
         print(f'Learning rate: {self.lr}')
+        # calculate overall threshold across TP and FP then check what's within across TP and FP
         print(f'Max probabilities')
 
         # with open("C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_training\\run_notes_pc.csv", 'a', newline = '') as rn:

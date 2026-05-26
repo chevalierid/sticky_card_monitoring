@@ -7,6 +7,7 @@ from math import floor, ceil
 from collections import defaultdict
 from label_crops import SegmentClassifier, calculate_mean_std_npb
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+import ultralytics
 import torch
 import torchvision.transforms.v2 as transforms  # composable transforms
 from torchvision.transforms import RandomRotation
@@ -18,11 +19,20 @@ from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 
 
+
 def cli_args():
     args_parse = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
+    args_parse.add_argument("-i", "--id", type=str, dest="id_num", required=True,
+                            help="Run ID number")
+    args_parse.add_argument("-s", "--source", type=str, dest="source_data_dir",
+                            help="Unsplit dataset location")
+    args_parse.add_argument("-d", "--destination", type=str, dest="destination_data_dir", required=True,
+                            help="Location where split dataset should be stored")
     args_parse.add_argument("-m", "--mode", type=str, dest="mode", required=True,
                             help="Whether to train model from scratch")
-    args_parse.add_argument("-s", "--split", dest="split", action='store_true',
+    args_parse.add_argument("-p", "--pt_path", type=str, dest="model_path",
+                            help="Location of pretrained model")
+    args_parse.add_argument("-l", "--split", dest="split", action='store_true',
                             help="Whether to split dataset")
     args_parse.add_argument("-r", "--arch", type=str, dest="arch",
                             help="Model architecture (resnet, bioclip)")
@@ -106,7 +116,7 @@ def split_data(source_data_dir, destination_data_dir):
     test_files.close()
     return filenames, num_files
 
-def classify(mode, split, arch, size_aware):
+def classify(id_num, source_data_dir, destination_data_dir, mode, model_path, split, arch, size_aware):
     Transform = transforms.Compose([
         transforms.ToImage(),  # Convert to tensor, only needed if you had a PIL image
         # transforms.ToDtype(torch.uint8, scale=True),  # optional, most input are already uint8 at this point
@@ -125,10 +135,6 @@ def classify(mode, split, arch, size_aware):
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
 
-    source_data_dir = "C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_training_unsplit"
-    destination_data_dir = "C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_training"
-    # source_data_dir = "C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_positive_training\\dataset_small_unsplit"
-    # destination_data_dir = "C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_positive_training\\dataset_small"
     if split:
         filenames, num_files = split_data(source_data_dir, destination_data_dir)
 
@@ -138,12 +144,12 @@ def classify(mode, split, arch, size_aware):
         MEAN_NPB, STD_NPB = None, None
 
     print(f"Creating SegmentClassifier")
-    run_id = "4.28_" + datetime.today().strftime("%m-%d-%H-%M")
+    run_id = id_num + datetime.today().strftime("%m-%d-%H-%M")
 
 
     print(f"Loading model")
     if mode == "raw":
-        classifier = SegmentClassifier(arch=arch, id=run_id, data_dir=destination_data_dir, num_classes=5,
+        classifier = SegmentClassifier(id=run_id, data_dir=destination_data_dir, num_classes=5,
                                        device=device, optim=2,
                                        lr=1e-2, batch_size=32, num_workers=4, Transform=Transform, sample=True,
                                        loss_weights=True, mean_npb=MEAN_NPB, std_npb=STD_NPB)
@@ -173,62 +179,73 @@ def classify(mode, split, arch, size_aware):
         # current_datetime = datetime.datetime.now()
         print("stop")
     else:
-        test_data_dir = "C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_positive_training\\data_test_set\\test"
-        pretrained = torch.load("C:\\Users\\ALANalysis\\flat-bug\\src\\A_rubi_positive_training\\SegmentClassifier_2025_03_27.pt", weights_only=False)
-        pretrained.eval()
-
-        class Classifier_Test(Dataset):
-            def __init__(self, dir, transform=None):
-                self.dir = dir
-                self.transform = transform
-                self.images = os.listdir(self.dir)
-
-            def __len__(self):
-                return len(self.images)
-
-            def __getitem__(self, index):
-                # print(os.path.join(self.dir, self.images[idx]))
-                img = Image.open(os.path.join(self.dir, self.images[index]))
-                return self.transform(img), self.images[index]
-
-        # check whether val_set results match last epoch or best epoch
-        val_set = Classifier_Test(test_data_dir, transform=transforms.Compose([
-            transforms.ToImage(),  # Convert to tensor, only needed if you had a PIL image
-            transforms.Resize(size=(224, 224), antialias=True),
-            transforms.ToDtype(torch.float32, scale=True),  # Normalize expects float input
-            transforms.Lambda(lambda x: x[:3])
-            # remove alpha channel since the model's dataset is built with ImageFolder which is RGB
-        ]))
-
-        val_loader = DataLoader(val_set, batch_size=32)
-
-        sub = pd.DataFrame(columns=['category', 'id'])
-        id_list = []
-        pred_list = []
-
-        pretrained = pretrained.to(device)
-
-        with torch.no_grad():
-            for (image, image_id) in val_loader:
-                image = image.to(device)
-
-                logits = pretrained(image)
-                predicted = list(torch.argmax(logits, 1).cpu().numpy())
-
-                for id in image_id:
-                    id_list.append(id)
-
-                for prediction in predicted:
-                    pred_list.append(prediction.tolist())
-
-        sub['category'] = pred_list
-        sub['id'] = id_list
-
-        mapping = {0: 'Non-target', 1: 'SWD_male', 2: 'SWD_parasitoid', 3: 'Weevil'}
-
-        sub['category'] = sub['category'].map(mapping)
-        sub = sub.sort_values(by='id')
-        sub.to_csv(test_data_dir + "train.csv", index=False)
+        classifier = SegmentClassifier(id=run_id, data_dir=destination_data_dir, num_classes=5,
+                                       device=device, optim=2,
+                                       lr=1e-2, batch_size=32, num_workers=4, Transform=Transform, sample=True,
+                                       loss_weights=True, mean_npb=MEAN_NPB, std_npb=STD_NPB)
+        pretrained = torch.load(model_path)
+        train_loader, val_loader = classifier.load_data()
+        classifier.load_model(pretrained)
+        print(f"Fitting pretrained SegmentClassifier")
+        history = classifier.fit(num_epochs=1, unfreeze_after=10, train_loader=train_loader, val_loader=val_loader)
+        print("Finished")
+    # else:
+    #     test_data_dir = "C:\\Users\\ALANalysis\\flat-bug\\src\\labeller\\data_test_set\\test"
+    #     pretrained = torch.load("C:\\Users\\ALANalysis\\flat-bug\\src\\labeller\\SegmentClassifier_2025_03_27.pt", weights_only=False)
+    #     pretrained.eval()
+    #
+    #     class Classifier_Test(Dataset):
+    #         def __init__(self, dir, transform=None):
+    #             self.dir = dir
+    #             self.transform = transform
+    #             self.images = os.listdir(self.dir)
+    #
+    #         def __len__(self):
+    #             return len(self.images)
+    #
+    #         def __getitem__(self, index):
+    #             # print(os.path.join(self.dir, self.images[idx]))
+    #             img = Image.open(os.path.join(self.dir, self.images[index]))
+    #             return self.transform(img), self.images[index]
+    #
+    #     # check whether val_set results match last epoch or best epoch
+    #     val_set = Classifier_Test(test_data_dir, transform=transforms.Compose([
+    #         transforms.ToImage(),  # Convert to tensor, only needed if you had a PIL image
+    #         transforms.Resize(size=(224, 224), antialias=True),
+    #         transforms.ToDtype(torch.float32, scale=True),  # Normalize expects float input
+    #         transforms.Lambda(lambda x: x[:3])
+    #         # remove alpha channel since the model's dataset is built with ImageFolder which is RGB
+    #     ]))
+    #
+    #     val_loader = DataLoader(val_set, batch_size=32)
+    #
+    #     sub = pd.DataFrame(columns=['category', 'id'])
+    #     id_list = []
+    #     pred_list = []
+    #
+    #     pretrained = pretrained.to(device)
+    #
+    #     with torch.no_grad():
+    #         for (image, image_id) in val_loader:
+    #             image = image.to(device)
+    #
+    #             logits = pretrained(image)
+    #             predicted = list(torch.argmax(logits, 1).cpu().numpy())
+    #
+    #             for id in image_id:
+    #                 id_list.append(id)
+    #
+    #             for prediction in predicted:
+    #                 pred_list.append(prediction.tolist())
+    #
+    #     sub['category'] = pred_list
+    #     sub['id'] = id_list
+    #
+    #     mapping = {0: 'Non-target', 1: 'SWD_male', 2: 'SWD_parasitoid', 3: 'Weevil'}
+    #
+    #     sub['category'] = sub['category'].map(mapping)
+    #     sub = sub.sort_values(by='id')
+    #     sub.to_csv(test_data_dir + "train.csv", index=False)
 
 
 
